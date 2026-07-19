@@ -193,7 +193,7 @@ export function VideoPickerApp() {
     } catch (error) {
       setFolders([]);
       setFolderError(
-        error instanceof Error ? error.message : "无法连接 OpenList",
+        error instanceof Error ? error.message : "无法读取视频索引",
       );
     } finally {
       setFolderLoading(false);
@@ -641,7 +641,7 @@ export function VideoPickerApp() {
                 <div className="folder-state">正在读取目录…</div>
               ) : folderError ? (
                 <div className="folder-state error">
-                  <strong>暂时无法读取 OpenList</strong>
+                  <strong>暂时无法读取视频索引</strong>
                   <span>{folderError}</span>
                   <button onClick={() => loadFolders(currentFolder)}>
                     重新连接

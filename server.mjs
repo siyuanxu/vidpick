@@ -1,5 +1,13 @@
 import { createServer } from "node:http";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -20,9 +28,11 @@ const VIDEO_EXTENSIONS = new Set([
   ".ogv",
 ]);
 const MAX_DIRECTORIES = 800;
+const MAX_INDEX_DIRECTORIES = 20_000;
 const MAX_VIDEOS = 20_000;
 const MAX_DELETE_BATCH = 500;
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_STRM_BYTES = 8 * 1024;
 const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_SCAN_CACHE_ENTRIES = 20;
 const scanCaches = new WeakMap();
@@ -87,6 +97,15 @@ function safeRemoteUrl(value) {
     throw apiError("OpenList 返回了不安全的地址");
   }
   return url.href;
+}
+
+function safeIndexedUrl(value, allowedHost) {
+  const href = safeRemoteUrl(value);
+  const url = new URL(href);
+  if (allowedHost && url.hostname.toLowerCase() !== allowedHost.toLowerCase()) {
+    throw apiError("STRM 播放地址不属于允许的 OpenList 主机", 403);
+  }
+  return href;
 }
 
 function cleanString(value, maximum = 4096) {
@@ -237,6 +256,198 @@ class OpenListClient {
   }
 }
 
+export class SmartStrmSource {
+  constructor(environment) {
+    this.environment = environment;
+    this.root = String(environment.SMARTSTRM_ROOT || "").trim();
+    this.openListBase = normalizePath(
+      environment.SMARTSTRM_OPENLIST_BASE || "/",
+    );
+    this.allowedHost = String(
+      environment.SMARTSTRM_ALLOWED_HOST || "",
+    ).trim();
+    this.rootPromise = null;
+    this.links = new Map();
+    this.cache = new Map();
+    this.hiddenPaths = new Set();
+  }
+
+  get enabled() {
+    return Boolean(this.root);
+  }
+
+  async realRoot() {
+    if (!this.enabled) throw apiError("SmartSTRM 索引未配置", 503);
+    this.rootPromise ||= realpath(resolve(this.root)).catch(() => {
+      throw apiError("SmartSTRM 索引目录不可用", 503);
+    });
+    return this.rootPromise;
+  }
+
+  async resolveDirectory(pathValue) {
+    const logicalPath = normalizePath(pathValue || "/");
+    const root = await this.realRoot();
+    const candidate = await realpath(
+      resolve(root, `.${logicalPath}`),
+    ).catch(() => {
+      throw apiError("STRM 目录不存在", 404);
+    });
+    if (!isInside(root, candidate) || !(await stat(candidate)).isDirectory()) {
+      throw apiError("STRM 目录超出允许范围", 403);
+    }
+    return { logicalPath, candidate };
+  }
+
+  async folders(pathValue) {
+    const { logicalPath, candidate } = await this.resolveDirectory(pathValue);
+    const entries = await readdir(candidate, { withFileTypes: true });
+    const folders = entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({
+        name: entry.name,
+        path: joinOpenListPath(logicalPath, entry.name),
+      }))
+      .sort((left, right) =>
+        left.name.localeCompare(right.name, "zh-CN", { numeric: true }),
+      );
+    return { path: logicalPath, root: "/", folders };
+  }
+
+  openListPathFromUrl(url) {
+    let decodedPath;
+    try {
+      decodedPath = decodeURIComponent(url.pathname);
+    } catch {
+      throw apiError("STRM 播放地址路径编码无效", 400);
+    }
+    const marker = decodedPath.indexOf("/d/");
+    if (marker < 0) throw apiError("STRM 不是 OpenList /d/ 播放地址", 400);
+    const absolutePath = normalizePath(decodedPath.slice(marker + 2));
+    if (!isInside(this.openListBase, absolutePath)) {
+      throw apiError("STRM 视频超出允许的 OpenList 根目录", 403);
+    }
+    const relativePath =
+      this.openListBase === "/"
+        ? absolutePath
+        : normalizePath(absolutePath.slice(this.openListBase.length));
+    if (!isVideo(relativePath)) throw apiError("STRM 目标不是视频", 400);
+    return relativePath;
+  }
+
+  async readEntry(filePath) {
+    const metadata = await stat(filePath);
+    if (!metadata.isFile() || metadata.size > MAX_STRM_BYTES) return null;
+    const content = await readFile(filePath, "utf8");
+    const line = content.split(/\r?\n/u).find((value) => value.trim())?.trim();
+    if (!line) return null;
+    const href = safeIndexedUrl(line, this.allowedHost);
+    const path = this.openListPathFromUrl(new URL(href));
+    if (this.hiddenPaths.has(path)) return null;
+    this.links.set(path, { href, filePath });
+    return {
+      id: path,
+      name: path.split("/").at(-1) || "video",
+      path,
+      size: 0,
+      modified: metadata.mtime.toISOString(),
+    };
+  }
+
+  async scan(pathValue, recursive) {
+    const { logicalPath, candidate } = await this.resolveDirectory(pathValue);
+    const cacheKey = `${logicalPath}\0${recursive ? "recursive" : "direct"}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return {
+        videos: shuffleVideos(
+          cached.videos.filter((video) => !this.hiddenPaths.has(video.path)),
+        ),
+        cached: true,
+      };
+    }
+    if (cached) this.cache.delete(cacheKey);
+
+    const queue = [candidate];
+    const videos = [];
+    const seenPaths = new Set();
+    let visitedDirectories = 0;
+    while (queue.length) {
+      const batch = queue.splice(0, 32);
+      visitedDirectories += batch.length;
+      if (visitedDirectories > MAX_INDEX_DIRECTORIES) {
+        throw apiError(
+          `STRM 目录过多，单次最多扫描 ${MAX_INDEX_DIRECTORIES} 个目录`,
+          413,
+        );
+      }
+      const listings = await Promise.all(
+        batch.map(async (directory) => ({
+          directory,
+          entries: await readdir(directory, { withFileTypes: true }),
+        })),
+      );
+      const files = [];
+      for (const { directory, entries } of listings) {
+        for (const entry of entries) {
+          if (entry.isDirectory() && recursive) {
+            queue.push(join(directory, entry.name));
+          } else if (
+            entry.isFile() &&
+            extname(entry.name).toLowerCase() === ".strm"
+          ) {
+            files.push(join(directory, entry.name));
+          }
+        }
+      }
+      while (files.length) {
+        const parsed = await Promise.all(
+          files
+            .splice(0, 128)
+            .map((filePath) => this.readEntry(filePath).catch(() => null)),
+        );
+        for (const video of parsed.filter(Boolean)) {
+          if (!seenPaths.has(video.path)) {
+            seenPaths.add(video.path);
+            videos.push(video);
+          }
+        }
+      }
+      if (videos.length > MAX_VIDEOS) {
+        throw apiError(`视频过多，单次最多生成 ${MAX_VIDEOS} 条`, 413);
+      }
+    }
+    while (this.cache.size >= MAX_SCAN_CACHE_ENTRIES) {
+      this.cache.delete(this.cache.keys().next().value);
+    }
+    this.cache.set(cacheKey, {
+      videos,
+      expiresAt: Date.now() + SCAN_CACHE_TTL_MS,
+    });
+    return { videos: shuffleVideos(videos), cached: false };
+  }
+
+  async media(pathValue) {
+    const path = normalizePath(pathValue);
+    if (this.hiddenPaths.has(path)) throw apiError("视频已删除", 404);
+    if (!this.links.has(path)) await this.scan("/", true);
+    const indexed = this.links.get(path);
+    if (!indexed) throw apiError("SmartSTRM 索引中没有这个视频", 404);
+    this.links.delete(path);
+    await this.readEntry(indexed.filePath).catch(() => null);
+    const refreshed = this.links.get(path);
+    if (!refreshed) throw apiError("SmartSTRM 播放地址已失效", 404);
+    return safeIndexedUrl(refreshed.href, this.allowedHost);
+  }
+
+  markDeleted(paths) {
+    for (const path of paths) {
+      this.hiddenPaths.add(path);
+      this.links.delete(path);
+    }
+    this.cache.clear();
+  }
+}
+
 function shuffleVideos(videos) {
   const shuffled = [...videos];
   for (let index = shuffled.length - 1; index > 0; index -= 1) {
@@ -378,10 +589,20 @@ function configuredRoot(environment) {
   return normalizePath(environment.OPENLIST_ROOT || "/");
 }
 
-async function handleOpenList(request, response, url, client, environment) {
+async function handleOpenList(
+  request,
+  response,
+  url,
+  client,
+  smartStrm,
+  environment,
+) {
   const root = configuredRoot(environment);
   const userAgent = request.headers["user-agent"] || "";
   const sendFolders = async (pathValue) => {
+    if (smartStrm.enabled) {
+      return json(response, 200, await smartStrm.folders(pathValue || "/"));
+    }
     const path = normalizePath(pathValue || root);
     if (!isInside(root, path)) throw apiError("目录超出允许范围", 403);
     const objects = await client.list(path, userAgent);
@@ -411,19 +632,28 @@ async function handleOpenList(request, response, url, client, environment) {
   }
 
   if (body.action === "scan") {
-    const path = normalizePath(body.path || root);
-    if (!isInside(root, path)) throw apiError("目录超出允许范围", 403);
-    const concurrency = Math.min(
-      12,
-      Math.max(1, Number(environment.SCAN_CONCURRENCY) || 6),
-    );
-    const { videos, cached } = await cachedVideoScan(
-      client,
-      path,
-      Boolean(body.recursive),
-      userAgent,
-      concurrency,
-    );
+    const path = normalizePath(body.path || (smartStrm.enabled ? "/" : root));
+    let videos;
+    let cached;
+    if (smartStrm.enabled) {
+      ({ videos, cached } = await smartStrm.scan(
+        path,
+        Boolean(body.recursive),
+      ));
+    } else {
+      if (!isInside(root, path)) throw apiError("目录超出允许范围", 403);
+      const concurrency = Math.min(
+        12,
+        Math.max(1, Number(environment.SCAN_CONCURRENCY) || 6),
+      );
+      ({ videos, cached } = await cachedVideoScan(
+        client,
+        path,
+        Boolean(body.recursive),
+        userAgent,
+        concurrency,
+      ));
+    }
     return json(response, 200, {
       path,
       recursive: Boolean(body.recursive),
@@ -436,7 +666,9 @@ async function handleOpenList(request, response, url, client, environment) {
   if (String(environment.OPENLIST_DELETE_ENABLED) !== "true") {
     throw apiError("服务器尚未启用删除功能", 403);
   }
-  const selectedRoot = normalizePath(body.root || "");
+  const selectedRoot = smartStrm.enabled
+    ? root
+    : normalizePath(body.root || "");
   if (!isInside(root, selectedRoot)) throw apiError("删除目录超出允许范围", 403);
   const paths = [...new Set(Array.isArray(body.paths) ? body.paths : [])].map(
     normalizePath,
@@ -497,15 +729,37 @@ async function handleOpenList(request, response, url, client, environment) {
       );
     }
   }
-  if (results.some((result) => result.ok)) scanCaches.delete(client);
+  const deletedPaths = results
+    .filter((result) => result.ok)
+    .map((result) => result.path);
+  if (deletedPaths.length) {
+    scanCaches.delete(client);
+    smartStrm.markDeleted(deletedPaths);
+  }
   return json(response, 200, { results });
 }
 
-async function handleMedia(request, response, url, client, environment) {
+async function handleMedia(
+  request,
+  response,
+  url,
+  client,
+  smartStrm,
+  environment,
+) {
   const path = normalizePath(url.searchParams.get("path"));
   const root = configuredRoot(environment);
   if (!isInside(root, path) || !isVideo(path)) {
     throw apiError("视频路径不在允许范围内", 403);
+  }
+  if (smartStrm.enabled) {
+    response.writeHead(302, {
+      Location: await smartStrm.media(path),
+      "Cache-Control": "private, no-store",
+      "Referrer-Policy": "no-referrer",
+    });
+    response.end();
+    return;
   }
   const item = await client.request(
     "/api/fs/get",
@@ -566,6 +820,8 @@ export function createVidpickServer(options = {}) {
     options.stateStore ||
     new StateStore(environment.DATA_FILE || join(projectDirectory, "data/state.json"));
   const client = options.openListClient || new OpenListClient(environment);
+  const smartStrm =
+    options.smartStrmSource || new SmartStrmSource(environment);
 
   return createServer(async (request, response) => {
     applySecurityHeaders(response);
@@ -589,11 +845,19 @@ export function createVidpickServer(options = {}) {
           response,
           url,
           client,
+          smartStrm,
           environment,
         );
       }
       if (url.pathname === "/api/media" && request.method === "GET") {
-        return await handleMedia(request, response, url, client, environment);
+        return await handleMedia(
+          request,
+          response,
+          url,
+          client,
+          smartStrm,
+          environment,
+        );
       }
       if (url.pathname.startsWith("/api/")) throw apiError("接口不存在", 404);
       if (!["GET", "HEAD"].includes(request.method || "")) {

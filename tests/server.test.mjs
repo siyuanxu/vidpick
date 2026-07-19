@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +16,7 @@ function createMockClient() {
   return {
     removed,
     listCalls: 0,
+    requestCalls: 0,
     async list(path) {
       this.listCalls += 1;
       if (path === "/") {
@@ -27,6 +34,7 @@ function createMockClient() {
       return [];
     },
     async request(endpoint, body) {
+      this.requestCalls += 1;
       if (endpoint === "/api/fs/get") {
         return {
           name: body.path.split("/").at(-1),
@@ -43,14 +51,41 @@ function createMockClient() {
   };
 }
 
-async function startServer({ deleteEnabled = false } = {}) {
+async function startServer({ deleteEnabled = false, smartStrm = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "vidpick-test-"));
+  const smartStrmRoot = join(directory, "strm");
+  if (smartStrm) {
+    await mkdir(join(smartStrmRoot, "library", "nested"), { recursive: true });
+    await writeFile(
+      join(smartStrmRoot, "library", "first.strm"),
+      "https://alist.example.com/d/115/media/clip.mp4?sign=private-one\n",
+    );
+    await writeFile(
+      join(smartStrmRoot, "library", "nested", "second.strm"),
+      "https://alist.example.com/d/115/archive/movie.webm?sign=private-two\n",
+    );
+    await writeFile(
+      join(smartStrmRoot, "library", "untrusted.strm"),
+      "https://untrusted.example/d/115/media/untrusted.mp4?sign=ignored\n",
+    );
+    await writeFile(
+      join(smartStrmRoot, "library", "cover.jpg"),
+      "not a video index\n",
+    );
+  }
   const client = createMockClient();
   const server = createVidpickServer({
     environment: {
       OPENLIST_ROOT: "/",
       OPENLIST_DELETE_ENABLED: String(deleteEnabled),
       PUBLIC_BASE_URL: "http://127.0.0.1",
+      ...(smartStrm
+        ? {
+            SMARTSTRM_ROOT: smartStrmRoot,
+            SMARTSTRM_OPENLIST_BASE: "/115",
+            SMARTSTRM_ALLOWED_HOST: "alist.example.com",
+          }
+        : {}),
     },
     openListClient: client,
     stateStore: new StateStore(join(directory, "state.json")),
@@ -211,5 +246,85 @@ test("keeps deletion disabled by default and rejects paths outside the selected 
     ]);
   } finally {
     await enabled.close();
+  }
+});
+
+test("uses SmartSTRM as the folder index and playback source without scanning OpenList", async () => {
+  const app = await startServer({ smartStrm: true });
+  try {
+    const foldersResponse = await fetch(`${app.base}/api/openlist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "folders", path: "/" }),
+    });
+    assert.equal(foldersResponse.status, 200);
+    const folders = await foldersResponse.json();
+    assert.deepEqual(folders.folders, [
+      { name: "library", path: "/library" },
+    ]);
+
+    const scanResponse = await fetch(`${app.base}/api/openlist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "scan",
+        path: "/library",
+        recursive: true,
+      }),
+    });
+    assert.equal(scanResponse.status, 200);
+    const scan = await scanResponse.json();
+    assert.deepEqual(
+      new Set(scan.videos.map((video) => video.path)),
+      new Set(["/media/clip.mp4", "/archive/movie.webm"]),
+    );
+    assert.equal(app.client.listCalls, 0);
+    assert.equal(app.client.requestCalls, 0);
+
+    const media = await fetch(
+      `${app.base}/api/media?path=%2Fmedia%2Fclip.mp4`,
+      { redirect: "manual" },
+    );
+    assert.equal(media.status, 302);
+    assert.equal(
+      media.headers.get("location"),
+      "https://alist.example.com/d/115/media/clip.mp4?sign=private-one",
+    );
+    assert.equal(app.client.requestCalls, 0);
+
+    const untrusted = await fetch(
+      `${app.base}/api/media?path=%2Fmedia%2Funtrusted.mp4`,
+      { redirect: "manual" },
+    );
+    assert.equal(untrusted.status, 404);
+  } finally {
+    await app.close();
+  }
+});
+
+test("maps SmartSTRM selections back to OpenList only after confirmed deletion", async () => {
+  const app = await startServer({ deleteEnabled: true, smartStrm: true });
+  try {
+    const response = await fetch(`${app.base}/api/openlist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "delete",
+        root: "/library",
+        paths: ["/media/clip.mp4"],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(app.client.removed, [
+      { dir: "/media", names: ["clip.mp4"] },
+    ]);
+
+    const media = await fetch(
+      `${app.base}/api/media?path=%2Fmedia%2Fclip.mp4`,
+      { redirect: "manual" },
+    );
+    assert.equal(media.status, 404);
+  } finally {
+    await app.close();
   }
 });

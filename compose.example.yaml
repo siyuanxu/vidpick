@@ -14,9 +14,13 @@ services:
       OPENLIST_ROOT: /
       OPENLIST_DELETE_ENABLED: "false"
       SCAN_CONCURRENCY: "6"
+      SMARTSTRM_ROOT: /smartstrm
+      SMARTSTRM_OPENLIST_BASE: /media
+      SMARTSTRM_ALLOWED_HOST: alist.example.com
     volumes:
       - vidpick-data:/app/data
       - /etc/vidpick/openlist-token.env:/run/secrets/openlist-token.env:ro
+      - /path/to/generated-strm:/smartstrm:ro
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
