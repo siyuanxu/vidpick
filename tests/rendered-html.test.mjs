@@ -21,6 +21,9 @@ test("implements the complete dual-mode and cross-device flow", async () => {
   assert.match(client, /exportQueue\("csv"\)/);
   assert.match(client, /跨设备续播/);
   assert.match(client, /XMLHttpRequest/);
+  assert.match(client, /视频播放进度/);
+  assert.match(client, /togglePlayback/);
+  assert.doesNotMatch(client, /\scontrols(?:\s|=)/);
   assert.doesNotMatch(client, /\bfetch\(/);
   assert.match(styles, /safe-area-inset/i);
   assert.doesNotMatch(client, /OPENLIST_TOKEN|OPENLIST_URL/);

@@ -142,6 +142,29 @@ test("stores synchronized state atomically", async () => {
   }
 });
 
+test("recovers the state write queue after a transient filesystem failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vidpick-state-recovery-"));
+  const blocker = join(directory, "data");
+  const file = join(blocker, "state.json");
+  const state = {
+    version: 1,
+    decisions: {},
+    likes: {},
+    activeSession: null,
+  };
+  try {
+    await writeFile(blocker, "temporarily unavailable");
+    const store = new StateStore(file);
+    await assert.rejects(store.write(state));
+    await rm(blocker, { force: true });
+    await mkdir(blocker);
+    assert.deepEqual(await store.write(state), state);
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")), state);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("lists folders, scans recursively, filters images, and redirects media", async () => {
   const app = await startServer();
   try {

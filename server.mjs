@@ -190,7 +190,7 @@ export class StateStore {
 
   async write(value) {
     const state = sanitizeState(value);
-    this.writeQueue = this.writeQueue.then(async () => {
+    this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
       await mkdir(dirname(this.file), { recursive: true, mode: 0o700 });
       const temporary = `${this.file}.${process.pid}.tmp`;
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, {

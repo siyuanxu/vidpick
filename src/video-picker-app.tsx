@@ -78,6 +78,17 @@ function formatDate(value: string) {
   }).format(date);
 }
 
+function formatPlaybackTime(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const rounded = Math.floor(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remaining = rounded % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`
+    : `${minutes}:${String(remaining).padStart(2, "0")}`;
+}
+
 function mediaUrl(path: string) {
   return `/api/media?path=${encodeURIComponent(path)}`;
 }
@@ -157,6 +168,7 @@ export function VideoPickerApp() {
   const [decisions, setDecisions] = useState<Record<string, Decision>>({});
   const [likes, setLikes] = useState<Record<string, "favorite">>({});
   const [muted, setMuted] = useState(true);
+  const [playing, setPlaying] = useState(false);
   const [contain, setContain] = useState(false);
   const [playerError, setPlayerError] = useState("");
   const [notice, setNotice] = useState("");
@@ -169,7 +181,10 @@ export function VideoPickerApp() {
   const pointerStartY = useRef<number | null>(null);
   const wheelLockedUntil = useRef(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const seekRef = useRef<HTMLInputElement | null>(null);
+  const timeLabelRef = useRef<HTMLSpanElement | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const syncFailureShown = useRef(false);
 
   const showNotice = useCallback((message: string) => {
     setNotice(message);
@@ -225,7 +240,16 @@ export function VideoPickerApp() {
           likes,
           activeSession,
         } satisfies SyncedState,
-      }).catch(() => showNotice("同步暂时失败，稍后会再次保存"));
+      })
+        .then(() => {
+          syncFailureShown.current = false;
+        })
+        .catch(() => {
+          if (!syncFailureShown.current) {
+            syncFailureShown.current = true;
+            showNotice("同步暂时失败，稍后会再次保存");
+          }
+        });
     }, 350);
     return () => clearTimeout(timer);
   }, [activeSession, decisions, likes, showNotice, stateReady]);
@@ -265,17 +289,39 @@ export function VideoPickerApp() {
   );
 
   const currentVideo = videos[index];
+
+  useEffect(() => {
+    setPlaying(false);
+    if (seekRef.current) {
+      seekRef.current.value = "0";
+      seekRef.current.max = "0.1";
+      seekRef.current.style.setProperty("--seek-progress", "0%");
+    }
+    if (timeLabelRef.current) timeLabelRef.current.textContent = "0:00 / 0:00";
+  }, [currentVideo?.path]);
   const nextVideos = useMemo(
-    () =>
-      Array.from({ length: PREFETCH_COUNT }, (_, offset) => {
+    () => {
+      const seen = new Set<string>();
+      return Array.from({ length: PREFETCH_COUNT }, (_, offset) => {
         if (!videos.length) return undefined;
         const candidateIndex =
           mode === "shuffle"
             ? (index + offset + 1) % videos.length
             : index + offset + 1;
         return videos[candidateIndex];
-      }).filter((video): video is Video => Boolean(video)),
-    [index, mode, videos],
+      }).filter((video): video is Video => {
+        if (
+          !video ||
+          video.path === currentVideo?.path ||
+          seen.has(video.path)
+        ) {
+          return false;
+        }
+        seen.add(video.path);
+        return true;
+      });
+    },
+    [currentVideo?.path, index, mode, videos],
   );
 
   const deleteQueue = useMemo(
@@ -397,6 +443,31 @@ export function VideoPickerApp() {
       return next;
     });
   }, [currentVideo, showNotice]);
+
+  const togglePlayback = useCallback(() => {
+    const player = videoRef.current;
+    if (!player) return;
+    if (player.paused) void player.play();
+    else player.pause();
+  }, []);
+
+  const updatePlaybackProgress = useCallback((player: HTMLVideoElement) => {
+    const duration = Number.isFinite(player.duration) ? player.duration : 0;
+    const currentTime = Number.isFinite(player.currentTime)
+      ? player.currentTime
+      : 0;
+    if (seekRef.current) {
+      seekRef.current.max = String(duration > 0 ? duration : 0.1);
+      seekRef.current.value = String(Math.min(currentTime, duration || 0));
+      seekRef.current.style.setProperty(
+        "--seek-progress",
+        `${duration > 0 ? (currentTime / duration) * 100 : 0}%`,
+      );
+    }
+    if (timeLabelRef.current) {
+      timeLabelRef.current.textContent = `${formatPlaybackTime(currentTime)} / ${formatPlaybackTime(duration)}`;
+    }
+  }, []);
 
   function handleTouchStart(event: TouchEvent) {
     if ((event.target as HTMLElement).closest("button, input")) return;
@@ -904,9 +975,14 @@ export function VideoPickerApp() {
         muted={muted}
         playsInline
         loop
-        controls
         preload="auto"
+        onClick={togglePlayback}
         onCanPlay={() => setPlayerError("")}
+        onLoadedMetadata={(event) => updatePlaybackProgress(event.currentTarget)}
+        onDurationChange={(event) => updatePlaybackProgress(event.currentTarget)}
+        onTimeUpdate={(event) => updatePlaybackProgress(event.currentTarget)}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
         onError={() =>
           setPlayerError("当前格式或编码可能不受这个浏览器支持")
         }
@@ -948,6 +1024,10 @@ export function VideoPickerApp() {
           <span>{muted ? "♩" : "♫"}</span>
           <small>{muted ? "静音" : "有声"}</small>
         </button>
+        <button onClick={togglePlayback} aria-label={playing ? "暂停" : "播放"}>
+          <span>{playing ? "Ⅱ" : "▶"}</span>
+          <small>{playing ? "暂停" : "播放"}</small>
+        </button>
         <button onClick={goNext} aria-label="下一条">
           <span>↑</span>
           <small>下一条</small>
@@ -955,8 +1035,28 @@ export function VideoPickerApp() {
       </aside>
 
       <section className="video-meta">
-        <div className="progress-line">
-          <span style={{ width: `${((index + 1) / videos.length) * 100}%` }} />
+        <div className="seek-control">
+          <input
+            ref={seekRef}
+            type="range"
+            min="0"
+            max="0.1"
+            step="0.1"
+            defaultValue="0"
+            aria-label="视频播放进度"
+            style={{ "--seek-progress": "0%" } as React.CSSProperties}
+            onChange={(event) => {
+              const nextTime = Number(event.currentTarget.value);
+              if (videoRef.current) videoRef.current.currentTime = nextTime;
+              if (videoRef.current) updatePlaybackProgress(videoRef.current);
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onPointerUp={(event) => event.stopPropagation()}
+            onTouchStart={(event) => event.stopPropagation()}
+            onTouchEnd={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
+          />
+          <span ref={timeLabelRef}>0:00 / 0:00</span>
         </div>
         <p>
           {index + 1} / {videos.length}
