@@ -1,0 +1,10 @@
+{
+  "name": "视频快刷",
+  "short_name": "视频快刷",
+  "description": "从 OpenList 随机播放、筛选和整理视频。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#08080d",
+  "theme_color": "#08080d",
+  "orientation": "any"
+}

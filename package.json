@@ -1,0 +1,32 @@
+{
+  "name": "vidpick",
+  "version": "1.0.0",
+  "description": "A lightweight, self-hosted OpenList video browser and organizer.",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "dev:server": "PORT=3001 node server.mjs",
+    "build": "tsc --noEmit && vite build",
+    "start": "node server.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "lint": "eslint src --max-warnings=0"
+  },
+  "dependencies": {
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "eslint": "9.39.4",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.56.1",
+    "vite": "^8.1.5"
+  },
+  "type": "module"
+}

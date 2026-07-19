@@ -1,0 +1,45 @@
+services:
+  vidpick:
+    build: .
+    container_name: vidpick
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      HOST: 127.0.0.1
+      PORT: 9037
+      PUBLIC_BASE_URL: https://vidpick.example.com
+      DATA_FILE: /app/data/state.json
+      OPENLIST_URL: http://127.0.0.1:5244
+      OPENLIST_TOKEN_FILE: /run/secrets/openlist-token.env
+      OPENLIST_ROOT: /
+      OPENLIST_DELETE_ENABLED: "false"
+    volumes:
+      - vidpick-data:/app/data
+      - /etc/vidpick/openlist-token.env:/run/secrets/openlist-token.env:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --tries=1
+        - --spider
+        - http://127.0.0.1:9037/healthz
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  vidpick-data:
