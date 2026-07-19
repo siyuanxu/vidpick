@@ -96,6 +96,53 @@ function csvCell(value: string | number) {
   return `"${String(value).replaceAll('"', '""')}"`;
 }
 
+type ApiOptions = {
+  method?: "GET" | "POST" | "PUT";
+  body?: unknown;
+};
+
+function apiJson<T>(path: string, options: ApiOptions = {}) {
+  return new Promise<T>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    const method = options.method || "GET";
+    try {
+      request.open(method, path, true);
+    } catch {
+      reject(new Error("浏览器无法创建接口请求，请刷新页面后重试"));
+      return;
+    }
+    request.withCredentials = true;
+    request.timeout = 30_000;
+    request.setRequestHeader("Accept", "application/json");
+    if (options.body !== undefined) {
+      request.setRequestHeader("Content-Type", "application/json");
+    }
+    request.onload = () => {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch {
+        reject(new Error(`服务器返回了无法识别的内容（HTTP ${request.status}）`));
+        return;
+      }
+      if (request.status >= 200 && request.status < 300) {
+        resolve(payload as T);
+        return;
+      }
+      const message =
+        payload && typeof payload === "object" && "error" in payload
+          ? String(payload.error)
+          : `请求失败（HTTP ${request.status}）`;
+      reject(new Error(message));
+    };
+    request.onerror = () => reject(new Error("网络连接失败，请稍后重试"));
+    request.ontimeout = () => reject(new Error("请求超时，请稍后重试"));
+    request.send(
+      options.body === undefined ? null : JSON.stringify(options.body),
+    );
+  });
+}
+
 export function VideoPickerApp() {
   const [screen, setScreen] = useState<Screen>("setup");
   const [mode, setMode] = useState<Mode>("organize");
@@ -134,12 +181,13 @@ export function VideoPickerApp() {
     setFolderLoading(true);
     setFolderError("");
     try {
-      const response = await fetch(
-        `/api/openlist?action=folders&path=${encodeURIComponent(path)}`,
-        { cache: "no-store" },
+      const payload = await apiJson<{ folders: Folder[]; path: string }>(
+        "/api/openlist",
+        {
+          method: "POST",
+          body: { action: "folders", path },
+        },
       );
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "无法读取目录");
       setFolders(payload.folders);
       setCurrentFolder(payload.path);
     } catch (error) {
@@ -154,12 +202,8 @@ export function VideoPickerApp() {
 
   useEffect(() => {
     loadFolders(ROOT_PATH);
-    void fetch("/api/state", { cache: "no-store" })
-      .then(async (response) => {
-        const payload = (await response.json()) as SyncedState & {
-          error?: string;
-        };
-        if (!response.ok) throw new Error(payload.error || "无法读取同步状态");
+    void apiJson<SyncedState>("/api/state")
+      .then((payload) => {
         setDecisions(payload.decisions || {});
         setLikes(payload.likes || {});
         setActiveSession(payload.activeSession || null);
@@ -173,15 +217,14 @@ export function VideoPickerApp() {
   useEffect(() => {
     if (!stateReady) return;
     const timer = setTimeout(() => {
-      void fetch("/api/state", {
+      void apiJson<SyncedState>("/api/state", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: {
           version: 1,
           decisions,
           likes,
           activeSession,
-        } satisfies SyncedState),
+        } satisfies SyncedState,
       }).catch(() => showNotice("同步暂时失败，稍后会再次保存"));
     }, 350);
     return () => clearTimeout(timer);
@@ -261,17 +304,14 @@ export function VideoPickerApp() {
     setPlayerError("");
     setDeleteResults([]);
     try {
-      const response = await fetch("/api/openlist", {
+      const payload = await apiJson<{ videos: Video[] }>("/api/openlist", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: {
           action: "scan",
           path: selectedFolder,
           recursive,
-        }),
+        },
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "扫描视频失败");
       if (!payload.videos.length) {
         throw new Error("这个目录里没有找到浏览器可尝试播放的视频文件");
       }
@@ -480,19 +520,17 @@ export function VideoPickerApp() {
     if (!deleteQueue.length) return;
     setDeleting(true);
     try {
-      const response = await fetch("/api/openlist", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "delete",
-          root: selectedFolder,
-          paths: deleteQueue.map((video) => video.path),
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok && !payload.results) {
-        throw new Error(payload.error || "删除失败");
-      }
+      const payload = await apiJson<{ results: DeleteResult[] }>(
+        "/api/openlist",
+        {
+          method: "POST",
+          body: {
+            action: "delete",
+            root: selectedFolder,
+            paths: deleteQueue.map((video) => video.path),
+          },
+        },
+      );
       const results: DeleteResult[] = payload.results || [];
       setDeleteResults(results);
       const deleted = new Set(

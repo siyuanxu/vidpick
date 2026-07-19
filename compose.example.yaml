@@ -13,6 +13,7 @@ services:
       OPENLIST_TOKEN_FILE: /run/secrets/openlist-token.env
       OPENLIST_ROOT: /
       OPENLIST_DELETE_ENABLED: "false"
+      SCAN_CONCURRENCY: "6"
     volumes:
       - vidpick-data:/app/data
       - /etc/vidpick/openlist-token.env:/run/secrets/openlist-token.env:ro

@@ -20,6 +20,8 @@ test("implements the complete dual-mode and cross-device flow", async () => {
   assert.match(client, /确认从 OpenList 删除/);
   assert.match(client, /exportQueue\("csv"\)/);
   assert.match(client, /跨设备续播/);
+  assert.match(client, /XMLHttpRequest/);
+  assert.doesNotMatch(client, /\bfetch\(/);
   assert.match(styles, /safe-area-inset/i);
   assert.doesNotMatch(client, /OPENLIST_TOKEN|OPENLIST_URL/);
   assert.match(server, /OPENLIST_TOKEN_FILE/);

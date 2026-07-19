@@ -23,6 +23,9 @@ const MAX_DIRECTORIES = 800;
 const MAX_VIDEOS = 20_000;
 const MAX_DELETE_BATCH = 500;
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
+const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_SCAN_CACHE_ENTRIES = 20;
+const scanCaches = new WeakMap();
 const projectDirectory = dirname(fileURLToPath(import.meta.url));
 
 const MIME_TYPES = {
@@ -234,39 +237,101 @@ class OpenListClient {
   }
 }
 
-async function scanVideos(client, root, recursive, userAgent) {
+function shuffleVideos(videos) {
+  const shuffled = [...videos];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[randomIndex]] = [
+      shuffled[randomIndex],
+      shuffled[index],
+    ];
+  }
+  return shuffled;
+}
+
+function scanCacheFor(client) {
+  if (!scanCaches.has(client)) scanCaches.set(client, new Map());
+  return scanCaches.get(client);
+}
+
+async function scanVideos(
+  client,
+  root,
+  recursive,
+  userAgent,
+  concurrency = 6,
+) {
   const queue = [root];
+  const queued = new Set(queue);
   const videos = [];
   let visitedDirectories = 0;
   while (queue.length) {
-    if (++visitedDirectories > MAX_DIRECTORIES) {
+    const batch = queue.splice(0, concurrency);
+    visitedDirectories += batch.length;
+    if (visitedDirectories > MAX_DIRECTORIES) {
       throw apiError(`目录过多，单次最多扫描 ${MAX_DIRECTORIES} 个目录`, 413);
     }
-    const current = queue.shift();
-    const objects = await client.list(current, userAgent);
-    for (const object of objects) {
-      const path = joinOpenListPath(current, object.name);
-      if (object.is_dir) {
-        if (recursive) queue.push(path);
-      } else if (isVideo(path)) {
-        videos.push({
-          id: path,
-          name: object.name,
-          path,
-          size: Number(object.size) || 0,
-          modified: object.modified || "",
-        });
-        if (videos.length >= MAX_VIDEOS) {
-          throw apiError(`视频过多，单次最多生成 ${MAX_VIDEOS} 条`, 413);
+    const listings = await Promise.all(
+      batch.map(async (current) => ({
+        current,
+        objects: await client.list(current, userAgent),
+      })),
+    );
+    for (const { current, objects } of listings) {
+      for (const object of objects) {
+        const path = joinOpenListPath(current, object.name);
+        if (object.is_dir) {
+          if (recursive && !queued.has(path)) {
+            queued.add(path);
+            queue.push(path);
+          }
+        } else if (isVideo(path)) {
+          videos.push({
+            id: path,
+            name: object.name,
+            path,
+            size: Number(object.size) || 0,
+            modified: object.modified || "",
+          });
+          if (videos.length > MAX_VIDEOS) {
+            throw apiError(`视频过多，单次最多生成 ${MAX_VIDEOS} 条`, 413);
+          }
         }
       }
     }
   }
-  for (let index = videos.length - 1; index > 0; index -= 1) {
-    const randomIndex = Math.floor(Math.random() * (index + 1));
-    [videos[index], videos[randomIndex]] = [videos[randomIndex], videos[index]];
-  }
   return videos;
+}
+
+async function cachedVideoScan(
+  client,
+  root,
+  recursive,
+  userAgent,
+  concurrency,
+) {
+  const cache = scanCacheFor(client);
+  const key = `${root}\0${recursive ? "recursive" : "direct"}`;
+  const existing = cache.get(key);
+  if (existing && existing.expiresAt > Date.now()) {
+    return { videos: shuffleVideos(existing.videos), cached: true };
+  }
+  if (existing) cache.delete(key);
+  const videos = await scanVideos(
+    client,
+    root,
+    recursive,
+    userAgent,
+    concurrency,
+  );
+  while (cache.size >= MAX_SCAN_CACHE_ENTRIES) {
+    cache.delete(cache.keys().next().value);
+  }
+  cache.set(key, {
+    videos,
+    expiresAt: Date.now() + SCAN_CACHE_TTL_MS,
+  });
+  return { videos: shuffleVideos(videos), cached: false };
 }
 
 function json(response, status, value) {
@@ -316,11 +381,8 @@ function configuredRoot(environment) {
 async function handleOpenList(request, response, url, client, environment) {
   const root = configuredRoot(environment);
   const userAgent = request.headers["user-agent"] || "";
-  if (request.method === "GET") {
-    if (url.searchParams.get("action") !== "folders") {
-      throw apiError("不支持的操作", 400);
-    }
-    const path = normalizePath(url.searchParams.get("path") || root);
+  const sendFolders = async (pathValue) => {
+    const path = normalizePath(pathValue || root);
     if (!isInside(root, path)) throw apiError("目录超出允许范围", 403);
     const objects = await client.list(path, userAgent);
     const folders = objects
@@ -333,19 +395,40 @@ async function handleOpenList(request, response, url, client, environment) {
         left.name.localeCompare(right.name, "zh-CN", { numeric: true }),
       );
     return json(response, 200, { path, root, folders });
+  };
+  if (request.method === "GET") {
+    if (url.searchParams.get("action") !== "folders") {
+      throw apiError("不支持的操作", 400);
+    }
+    return await sendFolders(url.searchParams.get("path"));
   }
   if (request.method !== "POST") throw apiError("不支持的请求方法", 405);
   assertSameOrigin(request, environment);
   const body = await readJson(request);
 
+  if (body.action === "folders") {
+    return await sendFolders(body.path);
+  }
+
   if (body.action === "scan") {
     const path = normalizePath(body.path || root);
     if (!isInside(root, path)) throw apiError("目录超出允许范围", 403);
-    const videos = await scanVideos(client, path, Boolean(body.recursive), userAgent);
+    const concurrency = Math.min(
+      12,
+      Math.max(1, Number(environment.SCAN_CONCURRENCY) || 6),
+    );
+    const { videos, cached } = await cachedVideoScan(
+      client,
+      path,
+      Boolean(body.recursive),
+      userAgent,
+      concurrency,
+    );
     return json(response, 200, {
       path,
       recursive: Boolean(body.recursive),
       videos,
+      cached,
     });
   }
 
@@ -414,6 +497,7 @@ async function handleOpenList(request, response, url, client, environment) {
       );
     }
   }
+  if (results.some((result) => result.ok)) scanCaches.delete(client);
   return json(response, 200, { results });
 }
 

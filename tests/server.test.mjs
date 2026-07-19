@@ -9,7 +9,9 @@ function createMockClient() {
   const removed = [];
   return {
     removed,
+    listCalls: 0,
     async list(path) {
+      this.listCalls += 1;
       if (path === "/") {
         return [
           { name: "nested", is_dir: true },
@@ -113,6 +115,17 @@ test("lists folders, scans recursively, filters images, and redirects media", as
     ).then((response) => response.json());
     assert.deepEqual(folders.folders, [{ name: "nested", path: "/nested" }]);
 
+    const postedFoldersResponse = await fetch(`${app.base}/api/openlist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "folders", path: "/" }),
+    });
+    assert.equal(postedFoldersResponse.status, 200);
+    const postedFolders = await postedFoldersResponse.json();
+    assert.deepEqual(postedFolders.folders, [
+      { name: "nested", path: "/nested" },
+    ]);
+
     const scanResponse = await fetch(`${app.base}/api/openlist`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -125,6 +138,15 @@ test("lists folders, scans recursively, filters images, and redirects media", as
       new Set(scan.videos.map((video) => video.path)),
       new Set(["/clip.mp4", "/nested/movie.webm"]),
     );
+    const callsAfterFirstScan = app.client.listCalls;
+    const cachedScanResponse = await fetch(`${app.base}/api/openlist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "scan", path: "/", recursive: true }),
+    });
+    assert.equal(cachedScanResponse.status, 200);
+    assert.equal((await cachedScanResponse.json()).cached, true);
+    assert.equal(app.client.listCalls, callsAfterFirstScan);
 
     const media = await fetch(`${app.base}/api/media?path=%2Fclip.mp4`, {
       redirect: "manual",
