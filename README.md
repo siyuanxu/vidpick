@@ -186,6 +186,14 @@ Dockerfile                   生产镜像
 compose.example.yaml         安全的单机部署示例
 ```
 
+## 原生客户端与 SwipeFlow
+
+Vidpick 本仓库只负责服务器、Web 界面、SmartSTRM/OpenList 连接、整理状态和安全删除，不内置桌面或手机原生播放器。
+
+`SwipeFlow` 是独立规划中的竖向视频流播放器项目，播放器核心不依赖 Vidpick，并将支持本地视频、本地 `.strm` 等媒体来源。Vidpick 只会作为 SwipeFlow 的一个可选远程连接器，为其提供目录、随机列表、播放地址、状态同步和确认删除能力。两个项目保持独立仓库、独立版本和独立部署；使用 Vidpick Web 版不需要安装 SwipeFlow，使用 SwipeFlow 的本地媒体功能也不需要部署 Vidpick。
+
+SwipeFlow 仓库发布后，本节会补充其公开仓库地址和兼容协议版本。
+
 ## 验证
 
 ```bash
