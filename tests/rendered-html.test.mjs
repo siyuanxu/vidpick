@@ -23,6 +23,9 @@ test("implements the complete dual-mode and cross-device flow", async () => {
   assert.match(client, /XMLHttpRequest/);
   assert.match(client, /视频播放进度/);
   assert.match(client, /togglePlayback/);
+  assert.match(client, /wakeLock\.request\("screen"\)/);
+  assert.match(client, /visibilitychange/);
+  assert.match(client, /releaseWakeLock/);
   assert.doesNotMatch(client, /\scontrols(?:\s|=)/);
   assert.doesNotMatch(client, /\bfetch\(/);
   assert.match(styles, /safe-area-inset/i);

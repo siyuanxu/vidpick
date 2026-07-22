@@ -49,6 +49,17 @@ type SyncedState = {
   activeSession: ActiveSession | null;
 };
 
+type ScreenWakeLockSentinel = EventTarget & {
+  released: boolean;
+  release: () => Promise<void>;
+};
+
+type WakeLockNavigator = Navigator & {
+  wakeLock?: {
+    request: (type: "screen") => Promise<ScreenWakeLockSentinel>;
+  };
+};
+
 const ROOT_PATH = "/";
 const PREFETCH_COUNT = 2;
 
@@ -185,12 +196,69 @@ export function VideoPickerApp() {
   const timeLabelRef = useRef<HTMLSpanElement | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncFailureShown = useRef(false);
+  const wakeLockRef = useRef<ScreenWakeLockSentinel | null>(null);
 
   const showNotice = useCallback((message: string) => {
     setNotice(message);
     if (noticeTimer.current) clearTimeout(noticeTimer.current);
     noticeTimer.current = setTimeout(() => setNotice(""), 2200);
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const releaseWakeLock = async () => {
+      const sentinel = wakeLockRef.current;
+      wakeLockRef.current = null;
+      if (sentinel && !sentinel.released) {
+        await sentinel.release().catch(() => undefined);
+      }
+    };
+
+    const syncWakeLock = async () => {
+      const shouldStayAwake =
+        screen === "player" &&
+        playing &&
+        document.visibilityState === "visible";
+
+      if (!shouldStayAwake) {
+        await releaseWakeLock();
+        return;
+      }
+
+      if (wakeLockRef.current && !wakeLockRef.current.released) return;
+      const wakeLock = (navigator as WakeLockNavigator).wakeLock;
+      if (!wakeLock) return;
+
+      try {
+        const sentinel = await wakeLock.request("screen");
+        if (disposed || document.visibilityState !== "visible") {
+          await sentinel.release().catch(() => undefined);
+          return;
+        }
+        wakeLockRef.current = sentinel;
+        sentinel.addEventListener(
+          "release",
+          () => {
+            if (wakeLockRef.current === sentinel) wakeLockRef.current = null;
+          },
+          { once: true },
+        );
+      } catch {
+        // Unsupported or denied wake locks must never interrupt playback.
+      }
+    };
+
+    const handleVisibilityChange = () => void syncWakeLock();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    void syncWakeLock();
+
+    return () => {
+      disposed = true;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      void releaseWakeLock();
+    };
+  }, [playing, screen]);
 
   const loadFolders = useCallback(async (path: string) => {
     setFolderLoading(true);
