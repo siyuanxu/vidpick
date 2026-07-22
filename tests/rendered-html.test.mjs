@@ -15,6 +15,9 @@ test("implements the complete dual-mode and cross-device flow", async () => {
   assert.match(client, /选择一个目录/);
   assert.match(client, /包含子目录/);
   assert.match(client, /PREFETCH_COUNT = 2/);
+  assert.match(client, /bufferedVideoRefs/);
+  assert.match(client, /bufferedVideos\.map/);
+  assert.match(client, /player\.readyState === HTMLMediaElement\.HAVE_NOTHING/);
   assert.match(client, /handleWheel/);
   assert.match(client, /ArrowDown/);
   assert.match(client, /确认从 OpenList 删除/);

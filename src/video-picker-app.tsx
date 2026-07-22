@@ -192,6 +192,7 @@ export function VideoPickerApp() {
   const pointerStartY = useRef<number | null>(null);
   const wheelLockedUntil = useRef(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const bufferedVideoRefs = useRef(new Map<string, HTMLVideoElement>());
   const seekRef = useRef<HTMLInputElement | null>(null);
   const timeLabelRef = useRef<HTMLSpanElement | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -391,6 +392,27 @@ export function VideoPickerApp() {
     },
     [currentVideo?.path, index, mode, videos],
   );
+  const bufferedVideos = useMemo(
+    () => (currentVideo ? [currentVideo, ...nextVideos] : nextVideos),
+    [currentVideo, nextVideos],
+  );
+
+  useEffect(() => {
+    if (screen !== "player" || !currentVideo) return;
+    const player = bufferedVideoRefs.current.get(currentVideo.path);
+    if (!player) return;
+    videoRef.current = player;
+    void player.play().catch(() => undefined);
+  }, [currentVideo, screen]);
+
+  useEffect(() => {
+    for (const video of nextVideos) {
+      const player = bufferedVideoRefs.current.get(video.path);
+      if (player && player.readyState === HTMLMediaElement.HAVE_NOTHING) {
+        player.load();
+      }
+    }
+  }, [nextVideos]);
 
   const deleteQueue = useMemo(
     () => videos.filter((video) => decisions[video.path] === "delete"),
@@ -1034,39 +1056,61 @@ export function VideoPickerApp() {
         </button>
       </header>
 
-      <video
-        className={`main-video ${contain ? "contain" : ""}`}
-        ref={videoRef}
-        key={currentVideo.path}
-        src={mediaUrl(currentVideo.path)}
-        autoPlay
-        muted={muted}
-        playsInline
-        loop
-        preload="auto"
-        onClick={togglePlayback}
-        onCanPlay={() => setPlayerError("")}
-        onLoadedMetadata={(event) => updatePlaybackProgress(event.currentTarget)}
-        onDurationChange={(event) => updatePlaybackProgress(event.currentTarget)}
-        onTimeUpdate={(event) => updatePlaybackProgress(event.currentTarget)}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onError={() =>
-          setPlayerError("当前格式或编码可能不受这个浏览器支持")
-        }
-      />
-
-      {nextVideos.map((video) => (
-        <video
-          className="preload-video"
-          key={`preload-${video.path}`}
-          src={mediaUrl(video.path)}
-          preload="auto"
-          muted
-          playsInline
-          aria-hidden="true"
-        />
-      ))}
+      {bufferedVideos.map((video) => {
+        const isCurrent = video.path === currentVideo.path;
+        return (
+          <video
+            className={
+              isCurrent
+                ? `main-video ${contain ? "contain" : ""}`
+                : "preload-video"
+            }
+            ref={(element) => {
+              if (element) {
+                bufferedVideoRefs.current.set(video.path, element);
+                if (isCurrent) videoRef.current = element;
+              } else {
+                bufferedVideoRefs.current.delete(video.path);
+              }
+            }}
+            key={video.path}
+            src={mediaUrl(video.path)}
+            preload="auto"
+            autoPlay={isCurrent}
+            muted={isCurrent ? muted : true}
+            playsInline
+            loop={isCurrent}
+            aria-hidden={isCurrent ? undefined : true}
+            onClick={isCurrent ? togglePlayback : undefined}
+            onCanPlay={isCurrent ? () => setPlayerError("") : undefined}
+            onLoadedMetadata={
+              isCurrent
+                ? (event) => updatePlaybackProgress(event.currentTarget)
+                : undefined
+            }
+            onDurationChange={
+              isCurrent
+                ? (event) => updatePlaybackProgress(event.currentTarget)
+                : undefined
+            }
+            onTimeUpdate={
+              isCurrent
+                ? (event) => updatePlaybackProgress(event.currentTarget)
+                : undefined
+            }
+            onPlay={isCurrent ? () => setPlaying(true) : undefined}
+            onPause={isCurrent ? () => setPlaying(false) : undefined}
+            onError={
+              isCurrent
+                ? () =>
+                    setPlayerError(
+                      "当前格式或编码可能不受这个浏览器支持",
+                    )
+                : undefined
+            }
+          />
+        );
+      })}
 
       <div className="video-shade top" />
       <div className="video-shade bottom" />
